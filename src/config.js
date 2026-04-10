@@ -12,6 +12,7 @@ module.exports = {
   // Bot Configuration
   BOT_TOKEN: (process.env.BOT_TOKEN || '').replace(/['"]/g, ''),
   MONGO_URI: (process.env.MONGO_URI || '').replace(/['"]/g, ''),
+  NODE_ENV: process.env.NODE_ENV || 'development',
 
   // Channel Configuration
   CHANNEL_USERNAME: process.env.CHANNEL_USERNAME || '@YourChannel',

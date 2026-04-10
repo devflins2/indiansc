@@ -1,5 +1,8 @@
-const axios = require('axios');
 const { Api } = require('telegram');
+const axios = require('axios');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 const fs = require('fs');
 const cheerio = require('cheerio');
 const { HttpsProxyAgent } = require('https-proxy-agent');
@@ -39,6 +42,7 @@ if (proxyAgent) logger.log('🌐 Proxy support enabled');
 
 // Global object to maintain persistent session cookies
 let cookieJar = {};
+let dynamicCookies = '';
 
 const updateCookies = (response) => {
   if (response && response.headers && response.headers['set-cookie']) {
@@ -57,8 +61,36 @@ const updateCookies = (response) => {
 const getScrapeHeaders = () => {
   return {
     ...config.HEADERS,
+    'sec-ch-ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
     'Cookie': `age_confirmed=1; is_adult=1; warning_accepted=true; splash_seen=1; kt_lang=en; ${dynamicCookies}`
   };
+};
+
+const requestWithRetry = async (url, options, maxRetries = 1) => {
+  let lastError;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
+      const response = await axios.get(url, {
+        ...options,
+        httpsAgent: proxyAgent,
+        httpAgent: proxyAgent,
+        timeout: config.TIMEOUT
+      });
+      updateCookies(response);
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (error.response && error.response.status === 403 && i < maxRetries) {
+        logger.log(`⚠️ 403 Blocked. Waiting 45s and retrying... (Attempt ${i + 1}/${maxRetries})`);
+        await sleep(45000); // 45 seconds cooldown
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
 };
 
 const normalizeUrl = (url) => {
@@ -78,41 +110,58 @@ const normalizeUrl = (url) => {
 
 const getVideoLinks = async () => {
   const urls = new Set();
-  let emptyPagesCount = 0; // Stop condition for deep scraping
-  const maxPages = config.MAX_PAGES || 3; // Wapas pehle jaisa simple 3 page wala limit
-  let page = 1; // Loop ke bahar define kiya taaki error block ko mil sake
+  let emptyPagesCount = 0;
+  const maxPages = config.MAX_PAGES || 3;
+  let page = 1;
+  let browser = null;
 
   try {
-    console.log(`▶️ [DEBUG] getVideoLinks() execution started... fetching from ${config.SOURCE_SITE}`);
-    logger.log(`🕵️‍♂️ Starting QUICK scrape of ${maxPages} pages...`);
+    console.log(`▶️ [PUPPETEER] Launching browser for Quick Scrape...`);
+    browser = await puppeteer.launch({
+      headless: config.NODE_ENV === 'production' ? true : false, // Visible for local debugging!
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      defaultViewport: null // Allows you to see the screen properly
+    });
+
+    const pPage = await browser.newPage();
+    await pPage.setUserAgent(config.HEADERS['User-Agent']);
+
+    // Check if Captcha is present and wait for user
+    logger.log(`🕵️‍♂️ Navigating to Homepage: ${config.SOURCE_SITE}`);
+    await pPage.goto(config.SOURCE_SITE, { waitUntil: 'networkidle2', timeout: 60000 });
+    
+    const pageTitle = await pPage.title();
+    if (pageTitle.toLowerCase().includes('cloudflare') || pageTitle.toLowerCase().includes('just a moment')) {
+      logger.log(`⚠️ CLOUDFLARE DETECTED! Please manually solve the captcha in the browser window...`);
+      logger.log(`⏳ Waiting 20 seconds for you to solve it...`);
+      await sleep(20000); // Give user 20s to click the captcha
+    }
     
     for (page = 1; page <= maxPages; page++) {
-
-      // Remove trailing slash to prevent //page/2/ format errors
       let url = config.SOURCE_SITE.replace(/\/$/, '');
       if (page > 1) {
-        if (url.includes('?')) {
-          url = `${url}&page=${page}`;
-        } else {
-          url = `${url}/page/${page}/`;
-        }
+        url = url.includes('?') ? `${url}&page=${page}` : `${url}/page/${page}/`;
       }
 
-      console.log(`⏳ [DEBUG] Requesting Page ${page}: ${url}`);
       const tempLinks = new Set();
-      const response = await axios.get(url, {
-        headers: {
-          ...getScrapeHeaders(),
-          'Referer': config.SOURCE_SITE
-        },
-        timeout: config.TIMEOUT,
-        maxRedirects: 10,
-        httpsAgent: proxyAgent,
-        httpAgent: proxyAgent
-      });
-      updateCookies(response);
-      const data = response.data;
-      console.log(`✅ [DEBUG] Successfully downloaded Page ${page} HTML (${data.length} bytes)`);
+      let pageContent = '';
+
+      try {
+        logger.log(`🕵️‍♂️ Scraping Page ${page}: ${url}`);
+        const response = await pPage.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+        
+        if (response && response.status() === 200) {
+          pageContent = await pPage.content();
+        } else {
+          logger.error(`Page ${page} failed with status ${response?.status()}`);
+        }
+      } catch (navErr) {
+        logger.error(`Navigation error on Page ${page}: ${navErr.message}`);
+      }
+
+      if (!pageContent) continue;
+
+      const data = pageContent;
 
       const $ = cheerio.load(data);
       $('a').each((i, el) => {
@@ -139,6 +188,8 @@ const getVideoLinks = async () => {
           tempLinks.add(cleanUrl);
         }
       });
+
+      console.log(`🔎 [DEBUG] Page ${page}: Scanned all links. Potential videos found: ${tempLinks.size}`);
 
       // Check against Database to find TRULY new videos
       let newLinksFound = 0;
@@ -173,16 +224,13 @@ const getVideoLinks = async () => {
         logger.log(`📄 Page ${page}: Found ${newLinksFound} NEW videos to download!`);
       }
 
-      // Anti-ban: Sleep random 4-8 seconds before next page to mimic human behavior
-      await sleep(Math.floor(Math.random() * 4000) + 4000);
+      // Anti-ban: Sleep random 10-20 seconds before next page to mimic human behavior
+      await sleep(Math.floor(Math.random() * 10000) + 10000);
     }
   } catch (error) {
-    console.error(`❌ [DEBUG] Error downloading page ${page}:`, error.message);
-    if (error.response && error.response.status === 404) {
-      logger.log(`🛑 Reached 404 on page ${page}. Pagination finished.`);
-    } else {
-      logger.error(`Homepage scraping error on page ${page}`, error);
-    }
+    logger.error('General getVideoLinks error', error);
+  } finally {
+    if (browser) await browser.close();
   }
 
   const result = Array.from(urls);
@@ -194,21 +242,48 @@ const getVideoLinks = async () => {
 
 const scrapeVideoInfo = async (url) => {
   let cleanUrl = normalizeUrl(url);
+  let browser = null;
 
   try {
-    const response = await axios.get(cleanUrl, {
-      headers: { 
-        ...getScrapeHeaders(), 
-        'Referer': config.SOURCE_SITE 
-      },
-      timeout: config.TIMEOUT,
-      maxRedirects: 10,
-      httpsAgent: proxyAgent,
-      httpAgent: proxyAgent
+    logger.log(`🔍 [PUPPETEER] Scraping detail: ${url}`);
+    
+    // Launch browser with Render-optimized arguments
+    browser = await puppeteer.launch({
+      headless: config.NODE_ENV === 'production' ? true : false,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote'
+      ]
     });
-    updateCookies(response);
-    const data = response.data;
 
+    const page = await browser.newPage();
+    
+    // Mimic the headers from config
+    await page.setUserAgent(config.HEADERS['User-Agent']);
+    await page.setViewport({ width: 1280, height: 800 });
+
+    // Enable stealth-like behavior
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': config.SOURCE_SITE
+    });
+
+    const response = await page.goto(cleanUrl, { 
+      waitUntil: 'domcontentloaded', 
+      timeout: 60000 
+    });
+
+    if (!response || response.status() === 403) {
+      throw new Error(`Cloudflare blocked Puppeteer too (Status: ${response?.status() || 'Unknown'})`);
+    }
+
+    // Wait a bit for potential JS redirects
+    await sleep(2000);
+
+    const data = await page.content();
     const $ = cheerio.load(data);
     let title = $('meta[property="og:title"]').attr('content') || $('title').text() || 'Unknown Video';
     title = title.split('–')[0].split('|')[0].trim().substring(0, 100);
@@ -250,13 +325,11 @@ const scrapeVideoInfo = async (url) => {
       directUrl = baseUrl + directUrl;
     }
 
-    // Check file size
-    const headResponse = await axios.head(directUrl, {
+    // Check file size with retry (HEAD requests are sensitive)
+    const headResponse = await requestWithRetry(directUrl, {
+      method: 'HEAD',
       headers: getScrapeHeaders(),
-      timeout: 15000,
-      httpsAgent: proxyAgent,
-      httpAgent: proxyAgent
-    }).catch(() => null);
+    }, 0).catch(() => null);
     if (headResponse) updateCookies(headResponse);
 
     const sizeBytes = headResponse && headResponse.headers['content-length'] ? parseInt(headResponse.headers['content-length']) : 0;
@@ -281,12 +354,16 @@ const scrapeVideoInfo = async (url) => {
     };
 
   } catch (error) {
-    if (error.code === 'ECONNABORTED') {
-      logger.log(`⏱️ Timeout scraping page: ${url}`);
-    } else {
-      logger.error(`Scrape error for ${url}`, error);
-    }
+    logger.error(`Puppeteer scrape error for ${url}`, error);
     return null;
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (e) {
+        logger.error('Error closing browser', e);
+      }
+    }
   }
 };
 
@@ -480,8 +557,8 @@ const processBatch = async (bot, client, queueItems) => {
       // Scrape video info
       const videoInfo = await scrapeVideoInfo(item.url);
 
-      // Anti-ban: Wait random 4-7 seconds between checking videos
-      await sleep(Math.floor(Math.random() * 3000) + 4000);
+      // Anti-ban: Wait random 15-25 seconds between checking videos
+      await sleep(Math.floor(Math.random() * 10000) + 15000);
 
       if (!videoInfo) {
         await db.markScrapeFailed(item._id, 'Failed to scrape');
