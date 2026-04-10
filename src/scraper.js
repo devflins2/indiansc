@@ -14,6 +14,11 @@ const config = require('./config');
 const db = require('./database');
 const logger = require('./logger');
 
+// Set Puppeteer Cache path for Render persistence
+if (process.env.NODE_ENV === 'production') {
+  process.env.PUPPETEER_CACHE_DIR = '/opt/render/.cache/puppeteer';
+}
+
 // Create temp directory
 if (!fs.existsSync(config.TEMP_DIR)) {
   fs.mkdirSync(config.TEMP_DIR, { recursive: true });
