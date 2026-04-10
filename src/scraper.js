@@ -37,13 +37,19 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const proxyAgent = config.PROXY_URL ? new HttpsProxyAgent(config.PROXY_URL) : null;
 if (proxyAgent) logger.log('🌐 Proxy support enabled');
 
-// Global variable to hold dynamic session cookies from Cloudflare
-let dynamicCookies = '';
+// Global object to maintain persistent session cookies
+let cookieJar = {};
 
 const updateCookies = (response) => {
   if (response && response.headers && response.headers['set-cookie']) {
-    const newCookies = response.headers['set-cookie'].map(c => c.split(';')[0]).join('; ');
-    dynamicCookies = newCookies; // Session token save kar liya Cloudflare ke liye
+    response.headers['set-cookie'].forEach(cookieStr => {
+      const parts = cookieStr.split(';')[0].split('=');
+      if (parts.length === 2) {
+        cookieJar[parts[0].trim()] = parts[1].trim();
+      }
+    });
+    // Convert jar back to string for the Cookie header
+    dynamicCookies = Object.entries(cookieJar).map(([k, v]) => `${k}=${v}`).join('; ');
   }
 };
 
@@ -95,7 +101,10 @@ const getVideoLinks = async () => {
       console.log(`⏳ [DEBUG] Requesting Page ${page}: ${url}`);
       const tempLinks = new Set();
       const response = await axios.get(url, {
-        headers: getScrapeHeaders(),
+        headers: {
+          ...getScrapeHeaders(),
+          'Referer': config.SOURCE_SITE
+        },
         timeout: config.TIMEOUT,
         maxRedirects: 10,
         httpsAgent: proxyAgent,
@@ -188,7 +197,10 @@ const scrapeVideoInfo = async (url) => {
 
   try {
     const response = await axios.get(cleanUrl, {
-      headers: { ...getScrapeHeaders(), 'Referer': config.SOURCE_SITE },
+      headers: { 
+        ...getScrapeHeaders(), 
+        'Referer': config.SOURCE_SITE 
+      },
       timeout: config.TIMEOUT,
       maxRedirects: 10,
       httpsAgent: proxyAgent,
